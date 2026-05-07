@@ -57,6 +57,7 @@ export function CalendarView({ onTogglePosition, position = "left" }: CalendarVi
   );
   const [calendarInitialDate] = useState<Date>(() => loadStoredCalendarDate() ?? new Date());
   const calendarRef = useRef<FullCalendar>(null);
+  const calendarContainerRef = useRef<HTMLDivElement>(null);
   const [isCreatingBlock, setIsCreatingBlock] = useState(false);
   
   // Use the scheduled events hook
@@ -594,6 +595,53 @@ export function CalendarView({ onTogglePosition, position = "left" }: CalendarVi
     return calendarRef.current?.getApi() || null;
   };
 
+  const updateCalendarSize = useCallback(() => {
+    const api = getCalendarApi();
+    if (!api) return;
+
+    api.updateSize();
+    requestAnimationFrame(() => api.updateSize());
+  }, []);
+
+  useEffect(() => {
+    const container = calendarContainerRef.current;
+    if (!container) return;
+
+    let frameId: number | null = null;
+    let settleTimeoutId: number | null = null;
+
+    const scheduleUpdate = () => {
+      if (frameId !== null) {
+        cancelAnimationFrame(frameId);
+      }
+      if (settleTimeoutId !== null) {
+        window.clearTimeout(settleTimeoutId);
+      }
+
+      frameId = requestAnimationFrame(() => {
+        frameId = null;
+        updateCalendarSize();
+        settleTimeoutId = window.setTimeout(updateCalendarSize, 180);
+      });
+    };
+
+    const resizeObserver = new ResizeObserver(scheduleUpdate);
+    resizeObserver.observe(container);
+    window.addEventListener("resize", scheduleUpdate);
+    scheduleUpdate();
+
+    return () => {
+      resizeObserver.disconnect();
+      window.removeEventListener("resize", scheduleUpdate);
+      if (frameId !== null) {
+        cancelAnimationFrame(frameId);
+      }
+      if (settleTimeoutId !== null) {
+        window.clearTimeout(settleTimeoutId);
+      }
+    };
+  }, [updateCalendarSize]);
+
   const goToTodayMinusOne = () => {
     const api = getCalendarApi();
     if (!api) return;
@@ -675,7 +723,11 @@ export function CalendarView({ onTogglePosition, position = "left" }: CalendarVi
       />
 
       {/* Calendar */}
-      <div className="flex-1 overflow-hidden p-4" onClick={handleCalendarClick}>
+      <div
+        ref={calendarContainerRef}
+        className="flex-1 overflow-hidden p-4"
+        onClick={handleCalendarClick}
+      >
         <FullCalendar
           ref={calendarRef}
           plugins={[dayGridPlugin, timeGridPlugin, interactionPlugin]}
