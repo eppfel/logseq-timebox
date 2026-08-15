@@ -10,15 +10,8 @@ import {
   normalizeStartHour,
   normalizeFirstDay,
   normalizeMultiDaySpan,
-  formatDateForJournal,
-  formatScheduledDate,
-  parseDurationToken,
   collapseNamespacesInTitle,
-  parseRepeater,
-  updateDurationTokenInContent,
   isClickAction,
-  nextTriCycleMarker,
-  applyTriCycleMarkerToContent,
   loadStoredCalendarView,
   persistCalendarView,
   loadStoredCalendarDate,
@@ -26,6 +19,7 @@ import {
   type ClickAction,
   type CalendarViewType,
 } from "./calendarUtils";
+import { getGraphAdapter } from "../adapters";
 import { CalendarEventContent } from "./CalendarEventContent";
 import { CalendarToolbar } from "./CalendarToolbar";
 import { useScheduledEvents } from "./hooks/useScheduledEvents";
@@ -47,7 +41,7 @@ const clickActionDescription = (a: ClickAction): string => {
     case "goto":
       return "open block in Logseq";
     case "cycleStatus":
-      return "cycle marker (TODO → DOING → DONE)";
+      return "cycle status (Todo → Doing → Done)";
   }
 };
 
@@ -129,64 +123,24 @@ export function CalendarView({ onTogglePosition, position = "left" }: CalendarVi
     };
   }, []);
 
-  const createBlockInDailyPage = useCallback(async (date: Date, content?: string, allDay: boolean = false, endDate?: Date) => {
+  const createBlockInDailyPage = useCallback(async (date: Date, allDay: boolean = false, endDate?: Date) => {
     if (isCreatingBlock) return;
 
     try {
       setIsCreatingBlock(true);
 
-      // Normalize date to local date (remove time component for journal page lookup)
-      const normalizedDate = new Date(date.getFullYear(), date.getMonth(), date.getDate());
-
-      // Get user's preferred date format from Logseq config
-      const userConfigs = await logseq.App.getUserConfigs();
-      const preferredDateFormat = userConfigs?.preferredDateFormat || "yyyy-MM-dd EEE";
-
-      // Format the date according to user's preference
-      const journalName = formatDateForJournal(normalizedDate, preferredDateFormat);
-
-      // Try to get the journal page
-      let page = await logseq.Editor.getPage(journalName);
-
-      // If page doesn't exist, try to create it
-      if (!page) {
-        page = await logseq.Editor.createPage(journalName, {}, { journal: true });
-      }
-
-      if (!page) {
-        logseq.UI.showMsg(`Failed to get or create journal page for ${normalizedDate.toLocaleDateString()}`, "error");
-        setIsCreatingBlock(false);
-        return;
-      }
-
-      // Use provided content or default to "TODO new todo from calendar ui"
-      let todoText = content || "TODO new todo from calendar ui";
-
-      // Compute compact duration token for title when timed selection has end
+      // Compute duration when a timed selection has an end
+      let durMins: number | null = null;
       if (!allDay && endDate && endDate.getTime() > date.getTime()) {
-        const durMins = Math.round((endDate.getTime() - date.getTime()) / 60000);
-        todoText = updateDurationTokenInContent(todoText, durMins);
-      } else {
-        todoText = updateDurationTokenInContent(todoText, null);
+        durMins = Math.round((endDate.getTime() - date.getTime()) / 60000);
       }
 
-      // SCHEDULED line without duration
-      const scheduledText = `SCHEDULED: <${formatScheduledDate(date, allDay)}>`;
+      const adapter = await getGraphAdapter();
+      const created = await adapter.createTask(date, allDay, durMins);
 
-      // Format: title with [d:...] on first line, SCHEDULED on second line
-      const blockContent = `${todoText}\n${scheduledText}`;
-
-      // Create a new block in the daily page
-      const block = await logseq.Editor.appendBlockInPage(
-        page.uuid,
-        blockContent
-      );
-
-      if (block) {
+      if (created) {
         // Reload events to show the new scheduled block
         refreshEvents();
-        // Navigate to the journal page
-        await logseq.Editor.scrollToBlockInPage(page.name, block.uuid);
         logseq.UI.showMsg(`Block created in ${date.toLocaleDateString()}`, "success");
       } else {
         logseq.UI.showMsg("Failed to create block", "error");
@@ -235,18 +189,16 @@ export function CalendarView({ onTogglePosition, position = "left" }: CalendarVi
     // For month view clicks or all-day selections, treat as all-day
     const isAllDay = selectInfo.allDay || !hasTime;
     
-    await createBlockInDailyPage(selectInfo.start, undefined, isAllDay, selectInfo.end ?? undefined);
+    await createBlockInDailyPage(selectInfo.start, isAllDay, selectInfo.end ?? undefined);
     // Unselect after creating
     getCalendarApi()?.unselect();
   }, [createBlockInDailyPage]);
 
   const cycleBlockMarker = useCallback(async (blockUuid: string) => {
     try {
-      const block = await logseq.Editor.getBlock(blockUuid);
-      if (!block) return;
-      const next = nextTriCycleMarker(block.marker as string | undefined);
-      const newContent = applyTriCycleMarkerToContent(block.content || "", next);
-      await logseq.Editor.updateBlock(blockUuid, newContent);
+      const adapter = await getGraphAdapter();
+      const next = await adapter.cycleStatus(blockUuid);
+      if (!next) return;
       logseq.UI.showMsg(`Status: ${next}`, "success");
       refreshEvents();
     } catch (error) {
@@ -257,18 +209,8 @@ export function CalendarView({ onTogglePosition, position = "left" }: CalendarVi
   // Navigate to block (used on double-click)
   const navigateToBlock = useCallback(async (blockUuid: string) => {
     try {
-      const block = await logseq.Editor.getBlock(blockUuid);
-      if (block?.page) {
-        const { id: pageId, originalName } = block.page;
-        let pageName = originalName;
-        if (!pageName) {
-          const page = await logseq.Editor.getPage(pageId);
-          pageName = page?.originalName || page?.name;
-        }
-        if (pageName) {
-          await logseq.Editor.scrollToBlockInPage(pageName, blockUuid);
-        }
-      }
+      const adapter = await getGraphAdapter();
+      await adapter.navigateToTask(blockUuid);
     } catch {
     }
   }, []);
@@ -342,31 +284,16 @@ export function CalendarView({ onTogglePosition, position = "left" }: CalendarVi
     });
 
     try {
-      const block = await logseq.Editor.getBlock(blockUuid);
-      if (!block) {
-        logseq.UI.showMsg("Block not found", "error");
-        return;
-      }
-
-      // Preserve duration if present; otherwise compute from event end if available
-      const existingDur = parseDurationToken(block.content || "");
       const computedDur = !allDay && eventEnd ? Math.max(1, Math.round((eventEnd.getTime() - newDate.getTime()) / 60000)) : null;
-      const durMins = existingDur ?? computedDur;
 
-      // Preserve repeater pattern (e.g., ++1w, .+1d)
-      const repeater = parseRepeater(block.content || "");
-      const repeaterSuffix = repeater ? ` ${repeater}` : "";
-
-      // Build new SCHEDULED with repeater preserved
-      let newScheduledText = `SCHEDULED: <${formatScheduledDate(newDate, allDay)}${repeaterSuffix}>`;
-      let updatedContent = block.content.replace(/SCHEDULED:\s*<[^>]+>(?:\s*\[d:[^\]]+\])?/, newScheduledText);
-
-      // Ensure duration token is on the title line
-      updatedContent = updateDurationTokenInContent(updatedContent, !allDay && durMins ? durMins : null);
-
-      await logseq.Editor.updateBlock(blockUuid, updatedContent);
+      const adapter = await getGraphAdapter();
+      // An existing stored duration wins over the event-derived one on plain moves
+      await adapter.reschedule(blockUuid, newDate, allDay, {
+        durationMins: computedDur,
+        preferExistingDuration: true,
+      });
       logseq.UI.showMsg("Event moved successfully", "success");
-      
+
       // Reload events to reflect changes
       refreshEvents();
     } catch (error) {
@@ -495,31 +422,20 @@ export function CalendarView({ onTogglePosition, position = "left" }: CalendarVi
     });
 
     try {
-      const block = await logseq.Editor.getBlock(blockUuid);
-      if (!block) {
-        logseq.UI.showMsg("Block not found", "error");
-        resizeInfo.revert();
-        return;
-      }
-
-      // Compute duration from resize and update token
+      // Compute duration from resize
       let durMins: number | null = null;
       if (!allDay && newEnd) {
         durMins = Math.max(1, Math.round((newEnd.getTime() - newStart.getTime()) / 60000));
       }
 
-      // Preserve repeater pattern (e.g., ++1w, .+1d)
-      const repeater = parseRepeater(block.content || "");
-      const repeaterSuffix = repeater ? ` ${repeater}` : "";
-
-      let newScheduledText = `SCHEDULED: <${formatScheduledDate(newStart, allDay)}${repeaterSuffix}>`;
-      let updatedContent = block.content.replace(/SCHEDULED:\s*<[^>]+>(?:\s*\[d:[^\]]+\])?/, newScheduledText);
-      // Update/insert [d:...] token on the title line
-      updatedContent = updateDurationTokenInContent(updatedContent, !allDay && durMins ? durMins : null);
-
-      await logseq.Editor.updateBlock(blockUuid, updatedContent);
+      const adapter = await getGraphAdapter();
+      // A resize explicitly sets the new duration, overriding any stored one
+      await adapter.reschedule(blockUuid, newStart, allDay, {
+        durationMins: durMins,
+        preferExistingDuration: false,
+      });
       logseq.UI.showMsg("Event resized successfully", "success");
-      
+
       // Reload events to reflect changes
       refreshEvents();
     } catch (error) {
@@ -533,27 +449,10 @@ export function CalendarView({ onTogglePosition, position = "left" }: CalendarVi
     e.stopPropagation(); // Prevent event click from firing
     
     try {
-      const block = await logseq.Editor.getBlock(blockUuid);
-      if (!block) {
-        logseq.UI.showMsg("Block not found", "error");
-        return;
-      }
-
-      // Remove SCHEDULED line and duration token
-      let updatedContent = block.content
-        .split("\n")
-        .filter((line: string) => !line.trim().startsWith("SCHEDULED:"))
-        .join("\n");
-      
-      // Remove duration token [d:...]
-      updatedContent = updatedContent.replace(/\s*\[d:[^\]]+\]/g, "");
-      
-      // Clean up any trailing whitespace
-      updatedContent = updatedContent.trimEnd();
-
-      await logseq.Editor.updateBlock(blockUuid, updatedContent);
+      const adapter = await getGraphAdapter();
+      await adapter.clearSchedule(blockUuid);
       logseq.UI.showMsg("Schedule cleared", "success");
-      
+
       // Reload events to reflect changes
       refreshEvents();
     } catch (error) {

@@ -5,7 +5,9 @@ A calendar sidebar plugin for Logseq that lets you visualize and manage your sch
 
 > Important Reminders:
 >
-> This plugin is only for MD (Logseq-OG) version. DB version is planned to be supported in the future.
+> This plugin supports both the MD (Logseq-OG) version and the DB version (Logseq 2.x). The graph type is detected automatically.
+>
+> On DB graphs: tasks are managed through the `Scheduled`/`Status` properties, a `Scheduled` time of exactly 00:00 is shown as an all-day event, and event duration is stored in a plugin-owned `duration` property (minutes).
 
 ## Layout and Logseq panels
 
@@ -30,7 +32,6 @@ The Timebox sidebar is drawn as a **fixed overlay** on top of the graph. It does
 ## Later
 
 - **Theme integration** - Seamless alignment with Logseq themes
-- **DB Version Support** - Compatibility with Logseq database versions
 
 ## Screenshots
 

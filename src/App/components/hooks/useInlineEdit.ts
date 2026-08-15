@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect, useCallback } from "react";
+import { getGraphAdapter } from "../../adapters";
 
 interface UseInlineEditReturn {
   editingEventId: string | null;
@@ -33,12 +34,9 @@ export function useInlineEdit(onSaveComplete: () => void): UseInlineEditReturn {
   // Enter edit mode for a block
   const enterEditMode = useCallback(async (blockUuid: string) => {
     try {
-      const block = await logseq.Editor.getBlock(blockUuid);
-      if (block) {
-        const contentLines = (block.content || "").split("\n");
-        const title = contentLines.find(
-          (line: string) => !line.startsWith("SCHEDULED:") && !line.startsWith("DEADLINE:")
-        ) || "";
+      const adapter = await getGraphAdapter();
+      const title = await adapter.getEditableTitle(blockUuid);
+      if (title !== null) {
         setEditingEventId(blockUuid);
         setEditingText(title);
         // Focus input after render
@@ -57,25 +55,8 @@ export function useInlineEdit(onSaveComplete: () => void): UseInlineEditReturn {
     }
 
     try {
-      const block = await logseq.Editor.getBlock(editingEventId);
-      if (!block) {
-        setEditingEventId(null);
-        setEditingText("");
-        return;
-      }
-
-      // Replace the title line while preserving SCHEDULED/DEADLINE lines
-      const lines = (block.content || "").split("\n");
-      const titleIndex = lines.findIndex(
-        (line: string) => !line.startsWith("SCHEDULED:") && !line.startsWith("DEADLINE:")
-      );
-      if (titleIndex !== -1) {
-        lines[titleIndex] = editingText;
-      } else {
-        lines.unshift(editingText);
-      }
-
-      await logseq.Editor.updateBlock(editingEventId, lines.join("\n"));
+      const adapter = await getGraphAdapter();
+      await adapter.saveTitle(editingEventId, editingText);
       logseq.UI.showMsg("Event updated", "success");
       onSaveComplete();
     } catch (error) {
@@ -104,4 +85,3 @@ export function useInlineEdit(onSaveComplete: () => void): UseInlineEditReturn {
     cancelEdit,
   };
 }
-

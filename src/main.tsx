@@ -4,6 +4,7 @@ import { createRoot } from "react-dom/client";
 import "./index.css";
 import App from "./App/App.tsx";
 import { initializeSidebarStuff } from "./sidebar-stuff.ts";
+import { resetGraphAdapter } from "./App/adapters";
 
 // Custom event name for database changes - used to notify React components
 export const DB_CHANGED_EVENT = "logseq-timebox-db-changed";
@@ -45,7 +46,7 @@ const main = async () => {
       type: "enum",
       default: "cycleStatus",
       title: "Double click action",
-      description: "What happens when you double-click an event. cycleStatus rotates marker: TODO → DOING → DONE → TODO (other markers become DOING first).",
+      description: "What happens when you double-click an event. cycleStatus rotates status: Todo → Doing → Done → Todo (other statuses become Doing first).",
       enumChoices: ["none", "edit", "goto", "cycleStatus"],
       enumPicker: "select",
     },
@@ -78,6 +79,12 @@ const main = async () => {
       // Dispatch custom event that React components can listen to
       window.dispatchEvent(new CustomEvent(DB_CHANGED_EVENT));
     }, 300);
+  });
+
+  // Switching graphs may change the graph type (MD ↔ DB) — re-detect and reload
+  logseq.App.onCurrentGraphChanged(() => {
+    resetGraphAdapter();
+    window.dispatchEvent(new CustomEvent(DB_CHANGED_EVENT));
   });
 
 };

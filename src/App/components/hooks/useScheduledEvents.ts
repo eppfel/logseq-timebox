@@ -1,14 +1,9 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import type { EventInput } from "@fullcalendar/core";
 import { DB_CHANGED_EVENT } from "../../../main";
-import { parseDurationToken, parseRepeater } from "../calendarUtils";
 import { fetchExternalIcs } from "../externalIcs";
-
-interface ScheduledInfo {
-  date: Date;
-  allDay: boolean;
-  durationMins?: number;
-}
+import { getGraphAdapter } from "../../adapters";
+import type { TimeboxTask } from "../../adapters";
 
 interface PendingUpdate {
   start: string;
@@ -17,35 +12,50 @@ interface PendingUpdate {
   timestamp: number;
 }
 
-/** Logseq priority token on a block (e.g. `[#A]`). */
-const hasPriorityA = (text: string) => /\[#A\]/i.test(text);
+const taskToEvent = (task: TimeboxTask): EventInput => {
+  const event: EventInput = {
+    id: task.uuid,
+    title: task.title,
+    start: task.start.toISOString(),
+    allDay: task.allDay,
+    extendedProps: {
+      blockUuid: task.uuid,
+      marker: task.rawStatus,
+      ...(task.recurringPattern ? { recurringPattern: task.recurringPattern } : {}),
+    },
+  };
 
-/** Markers where [#A] should use the high-priority red palette (NOW uses same color as DOING, not this branch). */
-const priorityARedMarkers = new Set<string>(["TODO", "LATER"]);
-
-const parseScheduledTime = (content: string): ScheduledInfo | null => {
-  // Parse SCHEDULED: <YYYY-MM-DD ddd HH:mm> or SCHEDULED: <YYYY-MM-DD ddd>
-  const scheduledMatch = content.match(/SCHEDULED:\s*<([^>]+)>/);
-  if (!scheduledMatch) return null;
-
-  const scheduledStr = scheduledMatch[1];
-  // Extract date and optional time
-  const dateTimeMatch = scheduledStr.match(/(\d{4}-\d{2}-\d{2})\s+\w+\s*(\d{2}:\d{2})?/);
-  if (!dateTimeMatch) return null;
-
-  const dateStr = dateTimeMatch[1];
-  const timeStr = dateTimeMatch[2];
-  const allDay = !timeStr;
-
-  if (allDay) {
-    const date = new Date(dateStr + "T00:00:00");
-    return { date, allDay: true };
+  // Set soft green background for DONE tasks
+  if (task.kind === "done") {
+    event.backgroundColor = "#d1f4d1";
+    event.borderColor = "#a3e4a3";
+    event.textColor = "#2d5f2d";
+  } else if (task.kind === "canceled") {
+    event.backgroundColor = "#e5e7eb";
+    event.borderColor = "#9ca3af";
+    event.textColor = "#374151";
+  } else if (task.kind === "inProgress") {
+    event.backgroundColor = "#ffe4cc";
+    event.borderColor = "#ffb366";
+    event.textColor = "#994d00";
+  } else if (task.highPriority) {
+    // High priority — [#A] (MD) or High/Urgent (DB)
+    event.backgroundColor = "#fecaca";
+    event.borderColor = "#f87171";
+    event.textColor = "#7f1d1d";
   } else {
-    const date = new Date(dateStr + "T" + timeStr + ":00");
-    // Try to parse duration token [d:...]
-    const durationMins = parseDurationToken(content) ?? undefined;
-    return { date, allDay: false, durationMins };
+    // Sweet blue for all other open tasks
+    event.backgroundColor = "#cce7ff";
+    event.borderColor = "#66b3ff";
+    event.textColor = "#004d99";
   }
+
+  if (!task.allDay && task.durationMins && task.durationMins > 0) {
+    const end = new Date(task.start.getTime() + task.durationMins * 60000);
+    event.end = end.toISOString();
+  }
+
+  return event;
 };
 
 interface UseScheduledEventsReturn {
@@ -67,7 +77,7 @@ export function useScheduledEvents(): UseScheduledEventsReturn {
   const debounceTimerRef = useRef<number | null>(null);
   // Cache for external ICS events (to avoid refetching on local changes)
   const externalCacheRef = useRef<{ urls: string; events: EventInput[] } | null>(null);
-  
+
   // Track pending updates to prevent stale DB data from overwriting optimistic UI
   const pendingUpdatesRef = useRef<Map<string, PendingUpdate>>(new Map());
   // Track dragging state to pause refreshes
@@ -87,7 +97,7 @@ export function useScheduledEvents(): UseScheduledEventsReturn {
 
   const updateEventOptimistically = useCallback((event: EventInput) => {
     if (!event.id) return;
-    
+
     // Update pending updates
     pendingUpdatesRef.current.set(event.id, {
       start: event.start as string,
@@ -112,134 +122,37 @@ export function useScheduledEvents(): UseScheduledEventsReturn {
     if (isDraggingRef.current) return;
 
     try {
-      // Query blocks with scheduled property
-      const scheduledBlocks = await logseq.DB.datascriptQuery(`
-        [:find (pull
-          ?block
-          [:block/uuid
-            :block/content
-            :block/marker
-            :block/scheduled
-            :block/deadline
-            {:block/page
-              [:db/id :block/name :block/original-name :block/journal-day :block/journal?]}])
-          :where
-          [?block :block/scheduled]
-          (or-join [?block]
-            (and
-              [?block :block/marker ?marker]
-              [(contains? #{"TODO" "DOING" "NOW" "LATER" "WAITING" "DONE" "CANCELED"} ?marker)])
-            [(missing? $ ?block :block/marker)])]
-      `);
+      const adapter = await getGraphAdapter();
+      const tasks = await adapter.fetchTasks();
 
       const calendarEvents: EventInput[] = [];
+      for (const task of tasks) {
+        const event = taskToEvent(task);
 
-      if (scheduledBlocks && scheduledBlocks.length > 0) {
-        for (const result of scheduledBlocks) {
-          const block = result[0];
-          if (!block || !block.scheduled) continue;
+        // Check for pending updates
+        const pending = pendingUpdatesRef.current.get(task.uuid);
+        if (pending) {
+          // Check if DB matches pending (DB caught up)
+          // We compare start time and allDay status
+          const isSynced = event.start === pending.start && event.allDay === pending.allDay;
 
-          // Parse scheduled date
-          let scheduledInfo = parseScheduledTime(block.content || "");
-          if (!scheduledInfo) {
-            // Fallback to block.scheduled property (YYYYMMDD format)
-            const scheduledStr = String(block.scheduled);
-            const year = parseInt(scheduledStr.substring(0, 4));
-            const month = parseInt(scheduledStr.substring(4, 6)) - 1;
-            const day = parseInt(scheduledStr.substring(6, 8));
-            scheduledInfo = { date: new Date(year, month, day), allDay: true };
-          }
-
-          // Get block title (first line of content without SCHEDULED)
-          const contentLines = (block.content || "").split("\n");
-          const title = contentLines.find(
-            (line: string) => !line.startsWith("SCHEDULED:") && !line.startsWith("DEADLINE:")
-          ) || "Untitled";
-          const cleanTitle = title.replace(/^\[(TODO|DOING|NOW|LATER|WAITING|DONE|CANCELED)\]\s*/, "").trim();
-
-          const recurringPattern = parseRepeater(block.content || "");
-
-          const event: EventInput = {
-            id: block.uuid,
-            title: cleanTitle,
-            start: scheduledInfo.date.toISOString(),
-            allDay: scheduledInfo.allDay,
-            extendedProps: {
-              blockUuid: block.uuid,
-              marker: block.marker,
-              ...(recurringPattern ? { recurringPattern } : {}),
-            },
-          };
-
-          // Set soft green background for DONE tasks
-          if (block.marker === "DONE") {
-            event.backgroundColor = "#d1f4d1";
-            event.borderColor = "#a3e4a3";
-            event.textColor = "#2d5f2d";
-          } else if (block.marker === "CANCELED") {
-            event.backgroundColor = "#e5e7eb";
-            event.borderColor = "#9ca3af";
-            event.textColor = "#374151";
-          } else if (block.marker === "DOING" || block.marker === "NOW") {
-            // In progress — same palette for DOING (classic) and NOW (NOW/LATER workflow)
-            event.backgroundColor = "#ffe4cc";
-            event.borderColor = "#ffb366";
-            event.textColor = "#994d00";
-          } else if (
-            block.marker &&
-            priorityARedMarkers.has(block.marker) &&
-            (hasPriorityA(cleanTitle) || hasPriorityA(block.content || ""))
-          ) {
-            // High-priority [#A] — red for TODO / LATER (not DOING/NOW/DONE)
-            event.backgroundColor = "#fecaca";
-            event.borderColor = "#f87171";
-            event.textColor = "#7f1d1d";
+          if (isSynced) {
+            pendingUpdatesRef.current.delete(task.uuid);
           } else {
-            // Sweet blue for all other tasks (e.g. WAITING, plain TODO without [#A])
-            event.backgroundColor = "#cce7ff";
-            event.borderColor = "#66b3ff";
-            event.textColor = "#004d99";
-          }
-
-          if (!scheduledInfo.allDay) {
-            const durMins = scheduledInfo.durationMins;
-            if (durMins && durMins > 0) {
-              const end = new Date(scheduledInfo.date.getTime() + durMins * 60000);
-              event.end = end.toISOString();
-            }
-          }
-
-          // Check for pending updates
-          const pending = pendingUpdatesRef.current.get(block.uuid);
-          if (pending) {
-            // Check if DB matches pending (DB caught up)
-            // We compare start time and allDay status
-            // Note: event.start is ISO string, pending.start is ISO string
-            const dbStart = event.start;
-            const pendingStart = pending.start;
-            
-            // Simple comparison. Might need more robust date comparison if formats differ slightly,
-            // but both should be ISO strings here.
-            const isSynced = dbStart === pendingStart && event.allDay === pending.allDay;
-            
-            if (isSynced) {
-              pendingUpdatesRef.current.delete(block.uuid);
+            // Not synced yet. Check if pending update is stale (e.g. > 15s)
+            if (Date.now() - pending.timestamp < 15000) {
+              // Keep optimistic state
+              event.start = pending.start;
+              event.end = pending.end;
+              event.allDay = pending.allDay;
             } else {
-              // Not synced yet. Check if pending update is stale (e.g. > 15s)
-              if (Date.now() - pending.timestamp < 15000) {
-                // Keep optimistic state
-                event.start = pending.start;
-                event.end = pending.end;
-                event.allDay = pending.allDay;
-              } else {
-                // Pending update timed out
-                pendingUpdatesRef.current.delete(block.uuid);
-              }
+              // Pending update timed out
+              pendingUpdatesRef.current.delete(task.uuid);
             }
           }
-
-          calendarEvents.push(event);
         }
+
+        calendarEvents.push(event);
       }
 
       // Fetch external ICS if enabled

@@ -23,8 +23,8 @@ function icsBodyFromRequestResult(raw: unknown): string | null {
  */
 async function fetchIcsText(url: string): Promise<string> {
   const reqFn =
-    typeof logseq !== "undefined" && typeof logseq.Request?._request === "function"
-      ? (logseq.Request._request as (opts: {
+    typeof logseq !== "undefined" && typeof (logseq as any).Request?._request === "function"
+      ? ((logseq as any).Request._request as (opts: {
           url: string;
           method: "GET";
           returnType: "text";

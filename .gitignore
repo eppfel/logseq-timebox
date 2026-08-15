@@ -9,3 +9,4 @@ logseq-marketplace/
 ai
 agents.md
 .devtools/
+.DS_Store
