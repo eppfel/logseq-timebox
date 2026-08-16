@@ -17,6 +17,29 @@ function icsBodyFromHostResult(raw: unknown): string | null {
 }
 
 /**
+ * Logseq OG 1.0 returns the proxied response body directly, while the 0.3.x
+ * SDK expects a response envelope. The SDK wraps that successful raw body in
+ * an LSPluginNetError whose status is therefore undefined. Recover only an
+ * actual iCalendar payload so genuine HTTP and network errors still fail.
+ */
+function icsBodyFromLegacyNetError(error: unknown): string | null {
+  if (!error || typeof error !== "object") return null;
+
+  const netError = error as {
+    name?: unknown;
+    status?: unknown;
+    response?: { _payload?: unknown };
+  };
+  if (netError.name !== "LSPluginNetError" || netError.status !== undefined) return null;
+
+  const rawPayload = netError.response?._payload;
+  if (typeof rawPayload !== "string") return null;
+
+  const normalized = rawPayload.replace(/^\uFEFF/, "").trimStart();
+  return normalized.startsWith("BEGIN:VCALENDAR") ? rawPayload : null;
+}
+
+/**
  * Load remote ICS text through Logseq's host proxy so marketplace iframes do
  * not depend on the feed's CORS policy. Keep the legacy Request API and browser
  * fetch as fallbacks for older hosts and unpacked development builds.
@@ -30,7 +53,9 @@ async function fetchIcsText(url: string): Promise<string> {
       const fromNet = icsBodyFromHostResult(raw);
       if (fromNet != null && fromNet.trim()) return fromNet;
     } catch (e) {
-      console.warn("[logseq-timebox] ICS via logseq.Net failed, trying fallbacks", url, e);
+      const fromLegacyHost = icsBodyFromLegacyNetError(e);
+      if (fromLegacyHost != null) return fromLegacyHost;
+      console.warn("[logseq-timebox] ICS via logseq.Net failed, trying fallbacks", e);
     }
   }
 
@@ -49,7 +74,7 @@ async function fetchIcsText(url: string): Promise<string> {
       const fromReq = icsBodyFromHostResult(raw);
       if (fromReq != null && fromReq.trim()) return fromReq;
     } catch (e) {
-      console.warn("[logseq-timebox] ICS via logseq.Request failed, using fetch()", url, e);
+      console.warn("[logseq-timebox] ICS via logseq.Request failed, using fetch()", e);
     }
   }
 
@@ -98,7 +123,7 @@ export const fetchExternalIcs = async (urls: string[]): Promise<EventInput[]> =>
   const windowStart = new Date(now.getTime() - WINDOW_PAST_DAYS * 24 * 3600 * 1000);
   const windowEnd = new Date(now.getTime() + WINDOW_FUTURE_DAYS * 24 * 3600 * 1000);
 
-  const fetches = uniqueUrls.map(async (url) => {
+  const fetches = uniqueUrls.map(async (url, feedIndex) => {
     try {
       const text = await fetchIcsText(url);
       if (!text || !text.trim()) return;
@@ -146,7 +171,7 @@ export const fetchExternalIcs = async (urls: string[]): Promise<EventInput[]> =>
                   }
                 }
                 const allDay = next.isDate ?? false;
-                results.push(buildEventInput(event.summary, startDate, endDate, allDay, url, now));
+                results.push(buildEventInput(event.summary, startDate, endDate, allDay, `External calendar ${feedIndex + 1}`, now));
               }
             } catch {
               // If recurrence expansion fails, fall back to single event
@@ -154,7 +179,7 @@ export const fetchExternalIcs = async (urls: string[]): Promise<EventInput[]> =>
               if (inWindow(startDate, windowStart, windowEnd)) {
                 const endDate = event.endDate?.toJSDate?.() ?? null;
                 const allDay = event.startDate.isDate ?? false;
-                results.push(buildEventInput(event.summary, startDate, endDate, allDay, url, now));
+                results.push(buildEventInput(event.summary, startDate, endDate, allDay, `External calendar ${feedIndex + 1}`, now));
               }
             }
           } else {
@@ -162,14 +187,14 @@ export const fetchExternalIcs = async (urls: string[]): Promise<EventInput[]> =>
             if (!inWindow(startDate, windowStart, windowEnd)) continue;
             const endDate = event.endDate?.toJSDate?.() ?? null;
             const allDay = event.startDate.isDate ?? false;
-            results.push(buildEventInput(event.summary, startDate, endDate, allDay, url, now));
+            results.push(buildEventInput(event.summary, startDate, endDate, allDay, `External calendar ${feedIndex + 1}`, now));
           }
         } catch {
           // Skip malformed events
         }
       }
     } catch (e) {
-      console.warn("[logseq-timebox] external ICS fetch/parse error", url, e);
+      console.warn("[logseq-timebox] external ICS fetch/parse error", e);
     }
   });
 

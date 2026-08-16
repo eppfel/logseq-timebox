@@ -20,8 +20,9 @@ const detectAdapter = async (): Promise<GraphAdapter> => {
         via = "checkCurrentIsDbGraph";
       }
     }
-  } catch (e) {
-    console.warn("logseq-timebox: checkCurrentIsDbGraph failed", e);
+  } catch {
+    // Expected on Logseq OG, whose plugin host predates this DB-only method.
+    // Continue to the graph-prefix fallback without reporting a false warning.
   }
 
   // Fallback: DB graph repo urls/names carry the "logseq_db_" prefix
@@ -31,7 +32,7 @@ const detectAdapter = async (): Promise<GraphAdapter> => {
       const url = (graph as any)?.url ?? "";
       const name = (graph as any)?.name ?? "";
       isDbGraph = String(url).startsWith("logseq_db_") || String(name).startsWith("logseq_db_");
-      via = `graph prefix (url=${url})`;
+      via = "graph prefix";
     } catch (e) {
       console.warn("logseq-timebox: getCurrentGraph failed, assuming MD graph", e);
     }
