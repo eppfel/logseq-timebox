@@ -12,6 +12,89 @@ interface PendingUpdate {
   timestamp: number;
 }
 
+interface ExternalEventsCache {
+  fingerprint: string;
+  fetchedAt: number;
+  events: EventInput[];
+}
+
+const EXTERNAL_CACHE_STORAGE_KEY = "logseq-timebox-external-events-v1";
+const LEGACY_EXTERNAL_CACHE_STORAGE_KEY = EXTERNAL_CACHE_STORAGE_KEY;
+const EXTERNAL_CACHE_REFRESH_MS = 5 * 60 * 1000;
+const EXTERNAL_CACHE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+
+/** Compact fingerprint so private feed URLs are never copied into the cache. */
+const fingerprintExternalUrls = (value: string): string => {
+  let hash = 2166136261;
+  for (let i = 0; i < value.length; i++) {
+    hash ^= value.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return `${value.length}:${(hash >>> 0).toString(16)}`;
+};
+
+const removeExternalEventsCache = async (): Promise<void> => {
+  try {
+    await logseq.FileStorage.removeItem(EXTERNAL_CACHE_STORAGE_KEY);
+  } catch {
+    // Missing cache files are expected.
+  }
+};
+
+const removeExternalEventsCacheForDbGraph = async (): Promise<void> => {
+  try {
+    const adapter = await getGraphAdapter();
+    if (adapter.graphKind === "db") {
+      await removeExternalEventsCache();
+    }
+  } catch {
+    // Cache cleanup is best-effort.
+  }
+};
+
+const readExternalEventsCache = async (fingerprint: string): Promise<ExternalEventsCache | null> => {
+  try {
+    const raw = await logseq.FileStorage.getItem(EXTERNAL_CACHE_STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Partial<ExternalEventsCache>;
+    if (
+      parsed.fingerprint !== fingerprint ||
+      typeof parsed.fetchedAt !== "number" ||
+      !Array.isArray(parsed.events) ||
+      Date.now() - parsed.fetchedAt > EXTERNAL_CACHE_MAX_AGE_MS
+    ) {
+      if (Date.now() - (parsed.fetchedAt ?? 0) > EXTERNAL_CACHE_MAX_AGE_MS) {
+        void removeExternalEventsCache();
+      }
+      return null;
+    }
+    return parsed as ExternalEventsCache;
+  } catch {
+    return null;
+  }
+};
+
+const writeExternalEventsCache = async (cache: ExternalEventsCache): Promise<void> => {
+  try {
+    await logseq.FileStorage.setItem(EXTERNAL_CACHE_STORAGE_KEY, JSON.stringify(cache));
+  } catch {
+    // Cache failures must not prevent live calendar loading.
+  }
+};
+
+const waitForPaint = (): Promise<void> =>
+  new Promise((resolve) => window.requestAnimationFrame(() => resolve()));
+
+const removeLegacyBrowserCache = (): void => {
+  try {
+    // Earlier development builds briefly used the shared iframe origin. Keep
+    // external calendar data only in Logseq's plugin-scoped file storage.
+    window.localStorage.removeItem(LEGACY_EXTERNAL_CACHE_STORAGE_KEY);
+  } catch {
+    // Browser storage may be unavailable in some plugin host configurations.
+  }
+};
+
 const taskToEvent = (task: TimeboxTask): EventInput => {
   const event: EventInput = {
     id: task.uuid,
@@ -76,12 +159,22 @@ export function useScheduledEvents(): UseScheduledEventsReturn {
   // Debounce timer ref
   const debounceTimerRef = useRef<number | null>(null);
   // Cache for external ICS events (to avoid refetching on local changes)
-  const externalCacheRef = useRef<{ urls: string; events: EventInput[] } | null>(null);
+  const externalCacheRef = useRef<ExternalEventsCache | null>(null);
+  // Reuse an active request when initialization triggers a follow-up DB refresh.
+  const externalRequestRef = useRef<{ fingerprint: string; promise: Promise<EventInput[]> } | null>(null);
+  // Ignore results from an older overlapping refresh.
+  const loadGenerationRef = useRef(0);
+  // The immediate initial load already includes external calendars.
+  const hasCompletedInitialExternalEffectRef = useRef(false);
 
   // Track pending updates to prevent stale DB data from overwriting optimistic UI
   const pendingUpdatesRef = useRef<Map<string, PendingUpdate>>(new Map());
   // Track dragging state to pause refreshes
   const isDraggingRef = useRef(false);
+
+  useEffect(() => {
+    removeLegacyBrowserCache();
+  }, []);
 
   const setIsDragging = useCallback((dragging: boolean) => {
     if (dragging) {
@@ -121,8 +214,38 @@ export function useScheduledEvents(): UseScheduledEventsReturn {
     // Skip loading if dragging
     if (isDraggingRef.current) return;
 
+    const generation = ++loadGenerationRef.current;
     try {
       const adapter = await getGraphAdapter();
+      const persistExternalCache = adapter.graphKind === "db";
+      let cachedExternalEvents: EventInput[] | null = null;
+      let externalFingerprint = "";
+      let shouldRefreshExternal = false;
+      let externalUrls: string[] = [];
+
+      if (externalVisible) {
+        externalUrls = (((logseq as any)?.settings?.externalIcsUrls || "") as string)
+          .split(/\r?\n/)
+          .map((u) => u.trim())
+          .filter(Boolean);
+        const urlsKey = externalUrls.join("|");
+        externalFingerprint = fingerprintExternalUrls(urlsKey);
+
+        let cache = externalCacheRef.current;
+        if (cache?.fingerprint !== externalFingerprint) {
+          cache = persistExternalCache
+            ? await readExternalEventsCache(externalFingerprint)
+            : null;
+          externalCacheRef.current = cache;
+        }
+        if (cache) {
+          cachedExternalEvents = cache.events;
+        }
+        shouldRefreshExternal =
+          externalUrls.length > 0 &&
+          (forceExternalRefresh || !cache || Date.now() - cache.fetchedAt >= EXTERNAL_CACHE_REFRESH_MS);
+      }
+
       const tasks = await adapter.fetchTasks();
 
       const calendarEvents: EventInput[] = [];
@@ -155,25 +278,37 @@ export function useScheduledEvents(): UseScheduledEventsReturn {
         calendarEvents.push(event);
       }
 
-      // Fetch external ICS if enabled
-      let externalEvents: EventInput[] = [];
-      if (externalVisible) {
-        const urls = (((logseq as any)?.settings?.externalIcsUrls || "") as string)
-          .split(/\r?\n/)
-          .map((u) => u.trim())
-          .filter(Boolean);
-        const urlsKey = urls.join("|");
+      if (generation !== loadGenerationRef.current) return;
 
-        // Use cache if available and not forcing refresh
-        if (!forceExternalRefresh && externalCacheRef.current?.urls === urlsKey) {
-          externalEvents = externalCacheRef.current.events;
-        } else if (urls.length) {
-          externalEvents = await fetchExternalIcs(urls);
-          externalCacheRef.current = { urls: urlsKey, events: externalEvents };
+      // Paint local tasks and any persisted external snapshot before starting a
+      // potentially slow DB-host network request.
+      setEvents([...calendarEvents, ...(cachedExternalEvents ?? [])]);
+
+      if (shouldRefreshExternal) {
+        await waitForPaint();
+        let request = externalRequestRef.current;
+        if (request?.fingerprint !== externalFingerprint) {
+          const promise = fetchExternalIcs(externalUrls).finally(() => {
+            if (externalRequestRef.current?.promise === promise) {
+              externalRequestRef.current = null;
+            }
+          });
+          request = { fingerprint: externalFingerprint, promise };
+          externalRequestRef.current = request;
         }
+        const externalEvents = await request.promise;
+        if (generation !== loadGenerationRef.current) return;
+        const cache: ExternalEventsCache = {
+          fingerprint: externalFingerprint,
+          fetchedAt: Date.now(),
+          events: externalEvents,
+        };
+        externalCacheRef.current = cache;
+        if (persistExternalCache) {
+          void writeExternalEventsCache(cache);
+        }
+        setEvents([...calendarEvents, ...externalEvents]);
       }
-
-      setEvents([...calendarEvents, ...externalEvents]);
     } catch {
     }
   }, [externalVisible]);
@@ -209,6 +344,10 @@ export function useScheduledEvents(): UseScheduledEventsReturn {
 
   // Reload when externalVisible changes
   useEffect(() => {
+    if (!hasCompletedInitialExternalEffectRef.current) {
+      hasCompletedInitialExternalEffectRef.current = true;
+      return;
+    }
     refreshEvents(true); // Force refresh external when visibility toggles
   }, [externalVisible, refreshEvents]);
 
@@ -221,6 +360,7 @@ export function useScheduledEvents(): UseScheduledEventsReturn {
       if (newSettings && Object.prototype.hasOwnProperty.call(newSettings, "externalIcsUrls")) {
         // Clear cache and refresh when URLs change
         externalCacheRef.current = null;
+        void removeExternalEventsCacheForDbGraph();
         refreshEvents(true);
       }
     });
