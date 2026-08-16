@@ -2,8 +2,8 @@ import * as ICALRaw from "ical.js";
 const ICAL: any = (ICALRaw as any)?.default ?? ICALRaw;
 import type { EventInput } from "@fullcalendar/core";
 
-/** Normalize host `Request` payload (shape varies by Logseq version). */
-function icsBodyFromRequestResult(raw: unknown): string | null {
+/** Normalize host HTTP payloads (shape varies by Logseq SDK version). */
+function icsBodyFromHostResult(raw: unknown): string | null {
   if (raw == null) return null;
   if (typeof raw === "string") return raw;
   if (typeof raw === "object") {
@@ -17,11 +17,23 @@ function icsBodyFromRequestResult(raw: unknown): string | null {
 }
 
 /**
- * Load remote ICS text. Prefer Logseq's host-proxied `Request` (marketplace
- * iframe often blocks plain `fetch`). Fall back to `fetch` when Request fails
- * or returns an unexpected shape — needed for unpacked / dev and older hosts.
+ * Load remote ICS text through Logseq's host proxy so marketplace iframes do
+ * not depend on the feed's CORS policy. Keep the legacy Request API and browser
+ * fetch as fallbacks for older hosts and unpacked development builds.
  */
 async function fetchIcsText(url: string): Promise<string> {
+  const net = typeof logseq !== "undefined" ? logseq.Net : undefined;
+
+  if (typeof net?.get === "function") {
+    try {
+      const raw = await net.get<string>(url, { responseType: "text" });
+      const fromNet = icsBodyFromHostResult(raw);
+      if (fromNet != null && fromNet.trim()) return fromNet;
+    } catch (e) {
+      console.warn("[logseq-timebox] ICS via logseq.Net failed, trying fallbacks", url, e);
+    }
+  }
+
   const reqFn =
     typeof logseq !== "undefined" && typeof (logseq as any).Request?._request === "function"
       ? ((logseq as any).Request._request as (opts: {
@@ -34,7 +46,7 @@ async function fetchIcsText(url: string): Promise<string> {
   if (reqFn) {
     try {
       const raw = await reqFn({ url, method: "GET", returnType: "text" });
-      const fromReq = icsBodyFromRequestResult(raw);
+      const fromReq = icsBodyFromHostResult(raw);
       if (fromReq != null && fromReq.trim()) return fromReq;
     } catch (e) {
       console.warn("[logseq-timebox] ICS via logseq.Request failed, using fetch()", url, e);
