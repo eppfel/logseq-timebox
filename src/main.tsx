@@ -87,14 +87,14 @@ const main = async () => {
     window.dispatchEvent(new CustomEvent(DB_CHANGED_EVENT));
   });
 
+  // Logseq APIs are not reliable until ready() has connected the plugin host.
+  // Mounting earlier can cache a false MD result during the slower web startup.
+  const rootEl = document.getElementById("root");
+  if (rootEl) {
+    createRoot(rootEl).render(<App />);
+  }
 };
 
 logseq.ready(main).catch((e) => {
   logseq.UI.showMsg(`${e ?? ""}`, "error");
 });
-
-const rootEl = document.getElementById("root");
-if (rootEl) {
-  createRoot(rootEl).render(<App />);
-}
-

@@ -7,8 +7,7 @@ export type { GraphAdapter, TimeboxTask, TaskKind, RescheduleOptions } from "./t
 let adapterPromise: Promise<GraphAdapter> | null = null;
 
 const detectAdapter = async (): Promise<GraphAdapter> => {
-  let isDbGraph = false;
-  let via = "default";
+  let explicitIsDbGraph: boolean | null = null;
 
   // Preferred: explicit host API (may not exist on older hosts)
   try {
@@ -16,8 +15,7 @@ const detectAdapter = async (): Promise<GraphAdapter> => {
     if (typeof check === "function") {
       const result = await check.call(logseq.App);
       if (typeof result === "boolean") {
-        isDbGraph = result;
-        via = "checkCurrentIsDbGraph";
+        explicitIsDbGraph = result;
       }
     }
   } catch {
@@ -25,18 +23,23 @@ const detectAdapter = async (): Promise<GraphAdapter> => {
     // Continue to the graph-prefix fallback without reporting a false warning.
   }
 
-  // Fallback: DB graph repo urls/names carry the "logseq_db_" prefix
-  if (via === "default") {
-    try {
-      const graph = await logseq.App.getCurrentGraph();
-      const url = (graph as any)?.url ?? "";
-      const name = (graph as any)?.name ?? "";
-      isDbGraph = String(url).startsWith("logseq_db_") || String(name).startsWith("logseq_db_");
-      via = "graph prefix";
-    } catch (e) {
-      console.warn("logseq-timebox: getCurrentGraph failed, assuming MD graph", e);
-    }
+  if (explicitIsDbGraph === true) {
+    console.info("logseq-timebox: using DB graph adapter (via checkCurrentIsDbGraph)");
+    return createDbAdapter();
   }
+
+  // Confirm false/unsupported host results against graph metadata. Web hosts
+  // can expose the plugin before their current DB graph has finished loading.
+  const graph = await logseq.App.getCurrentGraph();
+  if (!graph) {
+    throw new Error("logseq-timebox: current graph is not ready");
+  }
+  const url = (graph as any)?.url ?? "";
+  const name = (graph as any)?.name ?? "";
+  const isDbGraph = String(url).startsWith("logseq_db_") || String(name).startsWith("logseq_db_");
+  const via = isDbGraph || explicitIsDbGraph === null
+    ? "graph prefix"
+    : "checkCurrentIsDbGraph";
 
   console.info(`logseq-timebox: using ${isDbGraph ? "DB" : "MD"} graph adapter (via ${via})`);
   return isDbGraph ? createDbAdapter() : createMdAdapter();
@@ -44,7 +47,14 @@ const detectAdapter = async (): Promise<GraphAdapter> => {
 
 /** Returns the adapter for the currently open graph (cached until the graph changes). */
 export const getGraphAdapter = (): Promise<GraphAdapter> => {
-  if (!adapterPromise) adapterPromise = detectAdapter();
+  if (!adapterPromise) {
+    adapterPromise = detectAdapter().catch((error) => {
+      // An unavailable startup graph is not a stable MD result. Allow the next
+      // graph event or calendar refresh to retry detection.
+      adapterPromise = null;
+      throw error;
+    });
+  }
   return adapterPromise;
 };
 
