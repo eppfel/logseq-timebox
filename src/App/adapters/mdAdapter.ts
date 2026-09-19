@@ -137,7 +137,16 @@ export const createMdAdapter = (): GraphAdapter => ({
 
     // Build new SCHEDULED with repeater preserved
     const newScheduledText = `SCHEDULED: <${formatScheduledDate(start, allDay)}${repeaterSuffix}>`;
-    let updatedContent = (block.content || "").replace(/SCHEDULED:\s*<[^>]+>(?:\s*\[d:[^\]]+\])?/, newScheduledText);
+    const content = block.content || "";
+    const schedulePattern = /^[\t ]*SCHEDULED:[\t ]*<[^>\n]+>(?:[\t ]*\[d:[^\]\n]+\])?/m;
+    let updatedContent: string;
+    if (schedulePattern.test(content)) {
+      updatedContent = content.replace(schedulePattern, newScheduledText);
+    } else {
+      const lines = content.split("\n");
+      lines.splice(1, 0, newScheduledText);
+      updatedContent = lines.join("\n");
+    }
 
     // Ensure duration token is on the title line
     updatedContent = updateDurationTokenInContent(updatedContent, !allDay && durMins ? durMins : null);

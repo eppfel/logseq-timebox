@@ -13,7 +13,7 @@ The Timebox sidebar is drawn as a **fixed overlay** on top of the graph. It does
 ## Features
 
 - **Day/Week/Month/Multi-day Views** - Switch between different calendar views to plan your time (multi-day span is configurable)
-- **Drag & Drop** - Move tasks by dragging them to a new time slot
+- **Drag & Drop** - Drag a Logseq block by its bullet onto a calendar slot to schedule it, or move existing calendar tasks to reschedule them
 - **Resize Events** - Adjust task duration by dragging the edges
 - **Recurring Tasks** - Supports native recurrence in both graph types, including Markdown repeater patterns (`++1w`, `.+1d`, etc.)
 - **Quick Create** - Click or drag on the calendar to create new scheduled tasks
@@ -77,6 +77,8 @@ The Timebox sidebar is drawn as a **fixed overlay** on top of the graph. It does
 8. **Clear schedule**: Hover over an event and click the X button
 9. **External calendars**: Toggle "External on/off" and use Refresh when needed
 10. **Navigate**: Use the arrow buttons or "Today" to navigate dates
+
+In Logseq OG/Markdown, drag a block's bullet from a page into the calendar to schedule that block in place. Timed slots assign a date and start time, keeping an existing duration or using one hour. Month cells and the all-day row assign only a date. The target slot highlights while you drag. Drop one block at a time; only the dragged block is scheduled, not its children or other selected blocks.
 
 ## Settings
 

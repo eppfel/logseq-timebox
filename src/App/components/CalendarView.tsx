@@ -24,6 +24,7 @@ import { CalendarEventContent } from "./CalendarEventContent";
 import { CalendarToolbar } from "./CalendarToolbar";
 import { useScheduledEvents } from "./hooks/useScheduledEvents";
 import { useInlineEdit } from "./hooks/useInlineEdit";
+import { calendarDropTarget, isLogseqBlockDrag, readDroppedBlockUuid, type CalendarDropTarget } from "./logseqBlockDrop";
 
 interface CalendarViewProps {
   onTogglePosition?: () => void;
@@ -53,6 +54,8 @@ export function CalendarView({ onTogglePosition, position = "left" }: CalendarVi
   const calendarRef = useRef<FullCalendar>(null);
   const calendarContainerRef = useRef<HTMLDivElement>(null);
   const [isCreatingBlock, setIsCreatingBlock] = useState(false);
+  const [blockDropTarget, setBlockDropTarget] = useState<CalendarDropTarget | null>(null);
+  const blockDropPendingRef = useRef(false);
   
   // Use the scheduled events hook
   const { events, externalVisible, setExternalVisible, refreshEvents, setIsDragging, updateEventOptimistically } = useScheduledEvents();
@@ -319,6 +322,47 @@ export function CalendarView({ onTogglePosition, position = "left" }: CalendarVi
 
     await moveEvent(blockUuid, newDate, allDay, dropInfo.event.end);
   }, [moveEvent]);
+
+  const handleBlockDragOver = useCallback((event: React.DragEvent<HTMLDivElement>) => {
+    if (!isLogseqBlockDrag(event.dataTransfer)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const target = calendarDropTarget(event.currentTarget, event.clientX, event.clientY);
+    // Avoid the native link badge over valid slots. Scheduling still updates
+    // the original block in place; this only selects native drag feedback.
+    event.dataTransfer.dropEffect = target && !blockDropPendingRef.current ? "move" : "none";
+    setBlockDropTarget(target);
+  }, []);
+
+  const handleBlockDrop = useCallback(async (event: React.DragEvent<HTMLDivElement>) => {
+    if (!isLogseqBlockDrag(event.dataTransfer)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    setBlockDropTarget(null);
+    // Capture native transfer data before awaiting SDK calls.
+    const target = calendarDropTarget(event.currentTarget, event.clientX, event.clientY);
+    if (!target || blockDropPendingRef.current) return;
+    const uuid = readDroppedBlockUuid(event.dataTransfer);
+    if (!uuid) {
+      logseq.UI.showMsg("Could not identify this block. Drag a block by its bullet.", "warning");
+      return;
+    }
+    blockDropPendingRef.current = true;
+    try {
+      const adapter = await getGraphAdapter();
+      await adapter.reschedule(uuid, target.date, target.allDay, {
+        durationMins: target.allDay ? null : 60,
+        preferExistingDuration: true,
+      });
+      refreshEvents();
+      logseq.UI.showMsg("Block scheduled", "success");
+    } catch {
+      logseq.UI.showMsg("Could not schedule this block. Try dropping it again.", "error");
+      refreshEvents();
+    } finally {
+      blockDropPendingRef.current = false;
+    }
+  }, [refreshEvents]);
 
   const inferDateFromPoint = useCallback((x: number, y: number): { date: Date, allDay: boolean } | null => {
     const elements = document.elementsFromPoint(x, y);
@@ -626,7 +670,24 @@ export function CalendarView({ onTogglePosition, position = "left" }: CalendarVi
         ref={calendarContainerRef}
         className="flex-1 overflow-hidden p-4"
         onClick={handleCalendarClick}
+        onDragOver={handleBlockDragOver}
+        onDragLeave={(event) => {
+          if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setBlockDropTarget(null);
+        }}
+        onDrop={handleBlockDrop}
       >
+        {blockDropTarget && (
+          <div
+            aria-hidden="true"
+            style={{
+              position: "fixed", pointerEvents: "none", zIndex: 50,
+              left: blockDropTarget.rect.left, top: blockDropTarget.rect.top,
+              width: blockDropTarget.rect.width, height: blockDropTarget.rect.height,
+              background: "rgba(59, 130, 246, 0.2)", border: "2px solid #3b82f6",
+              boxSizing: "border-box",
+            }}
+          />
+        )}
         <FullCalendar
           ref={calendarRef}
           plugins={[dayGridPlugin, timeGridPlugin, interactionPlugin]}
