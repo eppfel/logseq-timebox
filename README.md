@@ -146,3 +146,6 @@ MIT
 ## Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request.
+
+Contributor lists are for people only. Do not list AI tools, models, or agents
+as contributors or add `Co-authored-by` commit trailers crediting them.
