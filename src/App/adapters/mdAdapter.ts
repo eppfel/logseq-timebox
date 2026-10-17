@@ -62,6 +62,10 @@ const extractTitleLine = (content: string): string =>
     .split("\n")
     .find((line: string) => !line.startsWith("SCHEDULED:") && !line.startsWith("DEADLINE:")) || "";
 
+/** Remove a leading status marker (`TODO title`, or `[TODO] title`) from a title line. */
+export const stripStatusMarker = (title: string): string =>
+  title.replace(/^\[?(TODO|DOING|NOW|LATER|WAIT|WAITING|DONE|CANCELED|CANCELLED|IN-PROGRESS)\]?(\s+|$)/, "").trim();
+
 export const createMdAdapter = (): GraphAdapter => ({
   graphKind: "md",
 
@@ -103,8 +107,7 @@ export const createMdAdapter = (): GraphAdapter => ({
         scheduledInfo = { date: new Date(year, month, day), allDay: true };
       }
 
-      const title = extractTitleLine(block.content || "") || "Untitled";
-      const cleanTitle = title.replace(/^\[(TODO|DOING|NOW|LATER|WAITING|DONE|CANCELED)\]\s*/, "").trim();
+      const cleanTitle = stripStatusMarker(extractTitleLine(block.content || "")) || "Untitled";
 
       tasks.push({
         uuid: block.uuid,
